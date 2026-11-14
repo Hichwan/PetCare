@@ -918,6 +918,18 @@ class PetCareApp:
                               bg=BG, fg=MUTED, size=9)
         self.due_hint.pack(anchor="w", pady=(5, 0))
 
+        # Filter only the signed-in user's visible cat profiles.
+        search_row = tk.Frame(body, bg=BG)
+        search_row.pack(fill="x", pady=(0, 8))
+        label(search_row, "Search cats:", bg=BG).pack(side="left")
+        self.cat_search = tk.StringVar()
+        search_box = entry(search_row, width=28)
+        search_box.configure(textvariable=self.cat_search)
+        search_box.pack(side="left", padx=8, ipady=4)
+        self.cat_search.trace_add("write", lambda *_: self.refresh_views())
+        button(search_row, "Clear", self.clear_cat_search,
+               color=PALE_BLUE, text_color=BLUE).pack(side="left")
+
         # The central list of all cats remains directly beneath today's tasks.
         label(body, "My cat profiles  •  Select one to open its tasks and health history",
               bg=BG, fg=TEXT, bold=True).pack(anchor="w", pady=(0, 7))
@@ -936,6 +948,9 @@ class PetCareApp:
                     lambda event: canvas.itemconfigure(window_id, width=event.width))
         self.refresh_views()
 
+    def clear_cat_search(self):
+        self.cat_search.set("")
+
     def refresh_views(self):
         if self.user is None:
             return
@@ -951,14 +966,18 @@ class PetCareApp:
         for child in self.cards_frame.winfo_children():
             child.destroy()
 
-        if not cats:
+        query = self.cat_search.get().strip().casefold()
+        visible_cats = [cat for cat in cats if query in cat["name"].casefold()]
+        if not visible_cats:
             empty = tk.Frame(self.cards_frame, bg=WHITE, padx=30, pady=25,
                              highlightbackground=BORDER, highlightthickness=1)
             empty.pack(fill="x", pady=5)
-            label(empty, "No cats yet", size=15, bold=True).pack(anchor="w")
-            label(empty, "Choose '+ Add cat' to create your first profile.",
+            label(empty, "No cats found" if query else "No cats yet",
+                  size=15, bold=True).pack(anchor="w")
+            label(empty, "Try a different name or press Clear." if query else
+                  "Choose '+ Add cat' to create your first profile.",
                   fg=MUTED).pack(anchor="w", pady=(4, 0))
-        for cat in cats:
+        for cat in visible_cats:
             row = tk.Frame(self.cards_frame, bg=WHITE,
                            highlightbackground=BORDER, highlightthickness=1)
             row.pack(fill="x", pady=4, padx=2)
@@ -1325,6 +1344,8 @@ class CatDialog:
         self.top.destroy()
         self.app.refresh_views()
         self.app.open_cat(cat_id)
+        messagebox.showinfo("Profile saved", "Cat profile saved successfully!",
+                            parent=self.app.root)
 
 
 class CatWindow:
