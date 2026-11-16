@@ -1,8 +1,8 @@
-"""Cat Care / Health Tracker v2.4 — single-file application with local user accounts.
+"""Cat Care / Health Tracker
 
 Keep this file next to your existing database.py; do not delete data/petcare.db.
 Run using the Python interpreter that displayed Tkinter successfully, e.g.:
-    python3.14 PetManagementApp.py
+    python3.14 PetManagementApp_Combined.py
 
 Account data, cats and care records share data/petcare.db. This upgrade
 adds an app_user table and a nullable owner_id column to cat on first run.
@@ -18,6 +18,7 @@ import secrets
 import sqlite3
 import sys
 import tkinter as tk
+import calendar
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -365,6 +366,37 @@ def due_records(user_id):
             ORDER BY r.next_due, r.record_id
         """, (user_id, date.today().isoformat())).fetchall()
 
+def records_on_date(user_id, day):
+    """All of this account's tasks that belong to one day (due date, else record date)."""
+    user_id = _user_id(user_id)
+    with closing(db.get_connection()) as conn:
+        return conn.execute("""
+            SELECT r.record_id, r.cat_id, c.name AS cat_name, r.category,
+                   r.task, r.record_date, r.next_due, r.notes, r.status
+            FROM care_record r JOIN cat c ON c.cat_id = r.cat_id
+            WHERE c.owner_id = ?
+              AND COALESCE(NULLIF(r.next_due, ''), r.record_date) = ?
+            ORDER BY c.name COLLATE NOCASE, r.task COLLATE NOCASE
+        """, (user_id, day.isoformat())).fetchall()
+
+
+def task_counts(user_id, year, month):
+    """{'YYYY-MM-DD': (total, open)} for one month, used by the popup calendar."""
+    user_id = _user_id(user_id)
+    start = date(year, month, 1)
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    with closing(db.get_connection()) as conn:
+        rows = conn.execute("""
+            SELECT COALESCE(NULLIF(r.next_due, ''), r.record_date) AS day,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN r.status = 'Open' THEN 1 ELSE 0 END) AS open_count
+            FROM care_record r JOIN cat c ON c.cat_id = r.cat_id
+            WHERE c.owner_id = ? AND day >= ? AND day < ?
+            GROUP BY day
+        """, (user_id, start.isoformat(), end.isoformat())).fetchall()
+    return {row["day"]: (row["total"], row["open_count"] or 0) for row in rows}
+
+
 
 def _check_export_destination(destination):
     destination = Path(destination).expanduser().resolve()
@@ -425,6 +457,8 @@ store = SimpleNamespace(
     delete_record=delete_record,
     dashboard_stats=dashboard_stats,
     due_records=due_records,
+    records_on_date=records_on_date,
+    task_counts=task_counts,
     export_records_csv=export_records_csv,
     export_account_json=export_account_json,
 )
@@ -661,6 +695,66 @@ def mac_light_appearance(window):
             pass
 
 
+class LightTabs(tk.Frame):
+    """Light-themed tabbed pages without macOS's dark native notebook frame.
+
+    Tk Labels draw the tab buttons and Tk Frames draw the content area. This
+    keeps backgrounds the same pale color as the main window, even if macOS
+    uses Dark Mode for native ttk.Notebook widgets.
+    """
+
+    def __init__(self, parent, *, surface=BG, tab_padding=14, font_size=10):
+        super().__init__(parent, bg=surface, bd=0, highlightthickness=0)
+        self.surface = surface
+        self.tab_padding = tab_padding
+        self.font_size = font_size
+        self.tab_strip = tk.Frame(self, bg=surface)
+        self.tab_strip.pack(fill="x", pady=(0, 8))
+        self.content = tk.Frame(self, bg=surface, bd=0, highlightthickness=0)
+        self.content.pack(fill="both", expand=True)
+        self._tabs = {}
+        self._selected = None
+
+    def add(self, page, *, text):
+        if page.master is not self.content:
+            raise ValueError("Create tab pages inside LightTabs.content")
+        tab = tk.Label(
+            self.tab_strip, text=text, bg=WHITE, fg=BLUE_DARK,
+            font=("Arial", self.font_size, "bold"),
+            padx=self.tab_padding, pady=10,
+            relief="flat", highlightthickness=1, highlightbackground=BORDER,
+            cursor="hand2", takefocus=1,
+        )
+        tab.pack(side="left", padx=(0, 7))
+        tab.bind("<Button-1>", lambda event, target=page: self.select(target))
+        tab.bind("<Return>", lambda event, target=page: self.select(target))
+        tab.bind("<space>", lambda event, target=page: self.select(target))
+        tab.bind("<Enter>", lambda event, target=page: self._hover(target, True))
+        tab.bind("<Leave>", lambda event, target=page: self._hover(target, False))
+        self._tabs[page] = tab
+        page.place(relx=0, rely=0, relwidth=1, relheight=1)
+        # Newly placed pages appear above previous pages. Restore selection.
+        self.select(self._selected if self._selected is not None else page)
+
+    def _hover(self, page, entering):
+        if page is not self._selected:
+            self._tabs[page].configure(bg=PALE_BLUE if entering else WHITE)
+
+    def select(self, page=None):
+        """Switch tabs, or return the selected page when called without args."""
+        if page is None:
+            return self._selected
+        if page not in self._tabs:
+            raise ValueError("Unknown tab page")
+        self._selected = page
+        page.tkraise()
+        for current, tab in self._tabs.items():
+            active = current is page
+            tab.configure(bg=BLUE if active else WHITE,
+                          fg=WHITE if active else BLUE_DARK)
+        return page
+
+
 class PetCareApp:
     def __init__(self):
         store.init()  # Adds account tables/ownership without removing original petcare.db data.
@@ -669,12 +763,15 @@ class PetCareApp:
         self.root.geometry("1100x760")
         self.root.minsize(820, 580)
         self.root.configure(bg=BG)
-        # Native ttk widgets follow the current macOS appearance.
+        mac_light_appearance(self.root)
+        # Consistent light backgrounds, including with system Dark Mode.
         self.user = None
         self.shell = None
         self.cat_windows = {}
         self.dialogs = set()
         self.daily_window = None  # Separate, reopenable daily-task window
+        self.calendar_window = None  # Independent, reopenable calendar popup
+        self.day_windows = {}
 
         style = ttk.Style(self.root)
         # The native Aqua theme is the most reliable choice on macOS.
@@ -694,7 +791,7 @@ class PetCareApp:
         style.configure("Treeview.Heading", font=("Arial", 10, "bold"),
                         background=PALE_BLUE, foreground=TEXT, padding=6)
         style.configure("TCombobox", padding=5)
-        print("Cat Care version: 2.4 (rounded canvas buttons, original colors)", flush=True)
+        print("Cat Care version: 2.6 (auto calendar + light tabs + search)", flush=True)
         print("Running Python:", sys.version.split()[0], sys.executable, flush=True)
         print("Running Tcl/Tk:", self.root.tk.call("info", "patchlevel"), flush=True)
         self.show_auth()
@@ -793,9 +890,10 @@ class PetCareApp:
                 return
             self.user = authenticated
             self.show_home()
-            # Show a separate daily checklist when something needs attention.
-            # The home-screen button can reopen it after the user closes it.
+            # Preserve the due-task reminder on sign-in and automatically open
+            # the independent calendar afterwards, keeping the calendar on top.
             self.root.after_idle(self.open_daily_if_needed)
+            self.root.after_idle(self.open_calendar)
 
         primary = ttk.Button(card, text="Log in", command=submit)
         primary.grid(row=11, column=0, sticky="ew", pady=(6, 12), ipady=6)
@@ -835,6 +933,13 @@ class PetCareApp:
 
     def install_menu(self):
         menu = tk.Menu(self.root)
+        view_menu = tk.Menu(menu, tearoff=False)
+        view_menu.add_command(label="Dashboard", command=self.show_dashboard_tab)
+        view_menu.add_command(label="Cat profiles", command=self.show_profiles_tab)
+        view_menu.add_separator()
+        view_menu.add_command(label="Open calendar...", command=self.open_calendar)
+        view_menu.add_command(label="Open daily task list", command=self.open_daily_tasks)
+        menu.add_cascade(label="View", menu=view_menu)
         data_menu = tk.Menu(menu, tearoff=False)
         data_menu.add_command(label="Export my care records (CSV)...",
                               command=self.export_csv)
@@ -843,8 +948,17 @@ class PetCareApp:
         menu.add_cascade(label="Data", menu=data_menu)
         self.root.config(menu=menu)
 
+    def show_dashboard_tab(self):
+        self.notebook.select(self.dashboard_tab)
+
+    def show_profiles_tab(self):
+        self.notebook.select(self.profiles_tab)
+
     def show_home(self):
-        self.install_menu()
+        """Dashboard and searchable cat profiles occupy separate main-window tabs.
+
+        The task calendar is *not* embedded here. It has its own popup window.
+        """
         base = self.new_shell()
         header = tk.Frame(base, bg=BLUE)
         header.pack(fill="x")
@@ -852,25 +966,34 @@ class PetCareApp:
         header_inner.pack(fill="x", padx=24, pady=15)
         label(header_inner, "CAT CARE  /  HEALTH TRACKER", size=17,
               bold=True, fg=WHITE, bg=BLUE).pack(side="left")
-        # Restore the original red-accented account controls, without macOS's
-        # gray native button treatment or text streaking.
         button(header_inner, "Log out", self.logout,
                color=WHITE, text_color=RED).pack(side="right", padx=(8, 0))
         button(header_inner, "Delete account", self.delete_my_account,
-               color="#f5e2e7", text_color=RED).pack(side="right")
+               color="#f5e2e7", text_color=RED).pack(side="right", padx=(8, 0))
+        button(header_inner, "Open calendar", self.open_calendar,
+               color=PALE_BLUE, text_color=BLUE).pack(side="right", padx=(8, 0))
         label(base, f"Signed in as {self.user['username']}",
-              bg=BG, fg=MUTED).pack(anchor="w", padx=26, pady=(10, 0))
+              bg=BG, fg=MUTED).pack(anchor="w", padx=26, pady=(10, 4))
 
-        body = tk.Frame(base, bg=BG)
-        body.pack(fill="both", expand=True, padx=24, pady=(0, 16))
-        top = tk.Frame(body, bg=BG)
-        top.pack(fill="x", pady=(5, 9))
-        label(top, "My cats", bold=True, size=20, bg=BG).pack(side="left")
-        button(top, "+ Add cat", self.add_cat).pack(side="right")
-        button(top, "+ Quick task", self.quick_task, color=GREEN).pack(
+        # Plain Tk tabs avoid the large black background rendered by Aqua's
+        # native ttk.Notebook on some macOS / Tk versions.
+        self.notebook = LightTabs(base, surface=BG, tab_padding=18)
+        self.notebook.pack(fill="both", expand=True, padx=24, pady=(8, 18))
+        self.dashboard_tab = tk.Frame(self.notebook.content, bg=BG)
+        self.profiles_tab = tk.Frame(self.notebook.content, bg=BG)
+        self.notebook.add(self.dashboard_tab, text="Dashboard / Tasks")
+        self.notebook.add(self.profiles_tab, text="Cat Profiles / Search")
+
+        # Dashboard: summary counters plus overdue/today tasks only.
+        dash_top = tk.Frame(self.dashboard_tab, bg=BG)
+        dash_top.pack(fill="x", pady=(13, 12))
+        label(dash_top, "Overview", bold=True, size=20, bg=BG).pack(side="left")
+        button(dash_top, "Open calendar popup", self.open_calendar,
+               color=BLUE).pack(side="right")
+        button(dash_top, "+ Quick task", self.quick_task, color=GREEN).pack(
             side="right", padx=9)
 
-        stats_frame = tk.Frame(body, bg=BG)
+        stats_frame = tk.Frame(self.dashboard_tab, bg=BG)
         stats_frame.pack(fill="x", pady=(0, 14))
         self.stats_widgets = {}
         for col, (key, title) in enumerate((("cats", "CAT PROFILES"),
@@ -887,10 +1010,8 @@ class PetCareApp:
             value.pack(pady=(0, 8))
             self.stats_widgets[key] = value
 
-        # The first thing visible after login: all overdue and today's tasks,
-        # across every cat belonging to the signed-in account.
-        attention = tk.Frame(body, bg=BG)
-        attention.pack(fill="x", pady=(0, 14))
+        attention = tk.Frame(self.dashboard_tab, bg=BG)
+        attention.pack(fill="both", expand=True, pady=(0, 12))
         attention_bar = tk.Frame(attention, bg=BG)
         attention_bar.pack(fill="x", pady=(0, 5))
         label(attention_bar, "Today's tasks & overdue", bold=True,
@@ -899,7 +1020,6 @@ class PetCareApp:
                color=PALE_BLUE, text_color=BLUE).pack(side="right")
         button(attention_bar, "Mark selected complete", self.complete_due_selected,
                color=GREEN).pack(side="right", padx=(0, 8))
-        # Visible next to Today's tasks, even when the list is empty.
         button(attention_bar, "Open daily task list", self.open_daily_tasks,
                color=BLUE, text_color=WHITE).pack(side="right", padx=(0, 8))
         self.due_summary = label(attention, "", bg=BG, fg=MUTED)
@@ -910,18 +1030,35 @@ class PetCareApp:
              ("due", "Due"), ("status", "Status")),
             (140, 260, 140, 110, 110),
         )
-        self.due_tree.configure(height=5)
-        frame.pack(fill="x")
+        frame.pack(fill="both", expand=True)
         self.due_tree.bind("<Double-1>", self.open_due_selected)
         self.due_tree.bind("<Return>", self.open_due_selected)
         self.due_hint = label(attention, "Double-click a task to open its cat.",
                               bg=BG, fg=MUTED, size=9)
         self.due_hint.pack(anchor="w", pady=(5, 0))
 
-        # The central list of all cats remains directly beneath today's tasks.
-        label(body, "My cat profiles  •  Select one to open its tasks and health history",
-              bg=BG, fg=TEXT, bold=True).pack(anchor="w", pady=(0, 7))
-        card_region = tk.Frame(body, bg=BG)
+        # Cat Profiles: original live search and cards on their own tab.
+        profiles_top = tk.Frame(self.profiles_tab, bg=BG)
+        profiles_top.pack(fill="x", pady=(13, 10))
+        label(profiles_top, "My cat profiles", size=20,
+              bold=True, bg=BG).pack(side="left")
+        button(profiles_top, "+ Add cat", self.add_cat).pack(side="right")
+        button(profiles_top, "+ Quick task", self.quick_task, color=GREEN).pack(
+            side="right", padx=(0, 9))
+        label(self.profiles_tab, "Search by name, then open a profile to see its care history.",
+              fg=MUTED, bg=BG).pack(anchor="w", pady=(0, 10))
+        search_row = tk.Frame(self.profiles_tab, bg=BG)
+        search_row.pack(fill="x", pady=(0, 10))
+        label(search_row, "Search cats:", bg=BG).pack(side="left")
+        self.cat_search = tk.StringVar()
+        search_box = entry(search_row, width=32)
+        search_box.configure(textvariable=self.cat_search)
+        search_box.pack(side="left", padx=8, ipady=4)
+        self.cat_search.trace_add("write", lambda *_: self.refresh_views())
+        button(search_row, "Clear", self.clear_cat_search,
+               color=PALE_BLUE, text_color=BLUE).pack(side="left")
+
+        card_region = tk.Frame(self.profiles_tab, bg=BG)
         card_region.pack(fill="both", expand=True)
         canvas = tk.Canvas(card_region, bg=BG, highlightthickness=0, bd=0)
         scroll = ttk.Scrollbar(card_region, orient="vertical", command=canvas.yview)
@@ -934,7 +1071,11 @@ class PetCareApp:
                               lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>",
                     lambda event: canvas.itemconfigure(window_id, width=event.width))
+        self.install_menu()
         self.refresh_views()
+
+    def clear_cat_search(self):
+        self.cat_search.set("")
 
     def refresh_views(self):
         if self.user is None:
@@ -951,14 +1092,18 @@ class PetCareApp:
         for child in self.cards_frame.winfo_children():
             child.destroy()
 
-        if not cats:
+        query = self.cat_search.get().strip().casefold()
+        visible_cats = [cat for cat in cats if query in cat["name"].casefold()]
+        if not visible_cats:
             empty = tk.Frame(self.cards_frame, bg=WHITE, padx=30, pady=25,
                              highlightbackground=BORDER, highlightthickness=1)
             empty.pack(fill="x", pady=5)
-            label(empty, "No cats yet", size=15, bold=True).pack(anchor="w")
-            label(empty, "Choose '+ Add cat' to create your first profile.",
+            label(empty, "No cats found" if query else "No cats yet",
+                  size=15, bold=True).pack(anchor="w")
+            label(empty, "Try a different name or press Clear." if query else
+                  "Choose '+ Add cat' to create your first profile.",
                   fg=MUTED).pack(anchor="w", pady=(4, 0))
-        for cat in cats:
+        for cat in visible_cats:
             row = tk.Frame(self.cards_frame, bg=WHITE,
                            highlightbackground=BORDER, highlightthickness=1)
             row.pack(fill="x", pady=4, padx=2)
@@ -1001,6 +1146,18 @@ class PetCareApp:
                 self.daily_window.refresh()
             else:
                 self.daily_window = None
+        if self.calendar_window is not None:
+            if self.calendar_window.top.winfo_exists():
+                self.calendar_window.calendar.refresh()
+            else:
+                self.calendar_window = None
+        for key, window in list(self.day_windows.items()):
+            if window.top.winfo_exists():
+                window.refresh()
+            else:
+                self.day_windows.pop(key, None)
+            
+            
         for cat_id, window in list(self.cat_windows.items()):
             if window.top.winfo_exists():
                 try:
@@ -1033,6 +1190,18 @@ class PetCareApp:
             self.daily_window.top.focus_set()
             return
         self.daily_window = DailyTaskWindow(self)
+
+    def open_calendar(self):
+        """Open a standalone calendar window, independent of both tabs."""
+        if self.user is None:
+            return
+        if self.calendar_window is not None and self.calendar_window.top.winfo_exists():
+            self.calendar_window.calendar.refresh()
+            self.calendar_window.top.deiconify()
+            self.calendar_window.top.lift()
+            self.calendar_window.top.focus_set()
+            return
+        self.calendar_window = CalendarWindow(self)
 
     def open_due_selected(self, event=None):
         selection = self.due_tree.selection()
@@ -1075,6 +1244,15 @@ class PetCareApp:
             messagebox.showerror("Cat unavailable", str(exc), parent=self.root)
             return
         self.cat_windows[cat_id] = CatWindow(self, cat)
+    def open_day(self, day):
+        key = day.isoformat()
+        window = self.day_windows.get(key)
+        if window is not None and window.top.winfo_exists():
+            window.refresh()
+            window.top.lift()
+            window.top.focus_force()
+            return
+        self.day_windows[key] = DayTasksWindow(self, day)
 
     def add_cat(self):
         CatDialog(self)
@@ -1089,6 +1267,8 @@ class PetCareApp:
         TaskDialog(self, cat_id=cat_id)
 
     def logout(self):
+        if self.calendar_window is not None:
+            self.calendar_window.close()
         if self.daily_window is not None:
             self.daily_window.close()
         for dialog in list(self.dialogs):
@@ -1098,6 +1278,9 @@ class PetCareApp:
         for window in list(self.cat_windows.values()):
             window.close()
         self.cat_windows.clear()
+        for window in list(self.day_windows.values()):
+            window.close()
+        self.day_windows.clear()
         self.show_auth()
 
     def delete_my_account(self):
@@ -1347,6 +1530,7 @@ class CatWindow:
         self.top.geometry("1040x670")
         self.top.minsize(760, 500)
         self.top.configure(bg=BG)
+        mac_light_appearance(self.top)
         self.top.protocol("WM_DELETE_WINDOW", self.close)
         header = tk.Frame(self.top, bg=WHITE)
         header.pack(fill="x", padx=18, pady=(16, 8))
@@ -1357,13 +1541,13 @@ class CatWindow:
         self.subtitle = label(self.top, "", bg=BG, fg=MUTED)
         self.subtitle.pack(anchor="w", padx=27, pady=(0, 9))
 
-        self.notebook = ttk.Notebook(self.top)
+        self.notebook = LightTabs(self.top, surface=BG, tab_padding=10, font_size=9)
         self.notebook.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         self.trees = {}
         self.group_keys = {}
         self.status_filters = {}
         for title, categories in self.TAB_GROUPS:
-            page = tk.Frame(self.notebook, bg=WHITE)
+            page = tk.Frame(self.notebook.content, bg=WHITE)
             self.notebook.add(page, text=title)
             heading_row = tk.Frame(page, bg=WHITE)
             heading_row.pack(fill="x", padx=14, pady=(12, 4))
@@ -1403,7 +1587,7 @@ class CatWindow:
             self.trees[title] = tree
             self.group_keys[title] = categories
 
-        profile = tk.Frame(self.notebook, bg=WHITE, padx=22, pady=20)
+        profile = tk.Frame(self.notebook.content, bg=WHITE, padx=22, pady=20)
         self.notebook.add(profile, text="Profile")
         profile.columnconfigure(1, weight=1)
         label(profile, "Cat profile", size=15, bold=True).grid(
@@ -1530,6 +1714,331 @@ class CatWindow:
         self.close()
         self.app.refresh_views()
 
+class DatePicker:
+    """Popup month calendar that writes a YYYY-MM-DD date into an Entry."""
+
+    def __init__(self, parent, target, allow_clear=False):
+        self.target = target
+        self.allow_clear = allow_clear
+        try:
+            self.selected = datetime.strptime(target.get().strip(), "%Y-%m-%d").date()
+        except ValueError:
+            self.selected = None
+        base = self.selected or date.today()
+        self.year, self.month = base.year, base.month
+
+        self.top = tk.Toplevel(parent)
+        self.top.title("Choose a date")
+        self.top.configure(bg=WHITE)
+        self.top.transient(parent)
+        self.top.resizable(False, False)
+        self.top.geometry(f"+{target.winfo_rootx()}"
+                          f"+{target.winfo_rooty() + target.winfo_height() + 4}")
+        self.top.bind("<Escape>", lambda event: self.top.destroy())
+        self.body = tk.Frame(self.top, bg=WHITE, padx=12, pady=12)
+        self.body.pack()
+        self.draw()
+        self.top.after_idle(self._grab)
+
+    def _grab(self):
+        try:
+            self.top.lift()
+            self.top.grab_set()
+            self.top.focus_set()
+        except tk.TclError:
+            pass
+
+    def shift(self, months):
+        total = self.year * 12 + (self.month - 1) + months
+        year, month = divmod(total, 12)
+        if 1 <= year <= 9999:
+            self.year, self.month = year, month + 1
+            self.draw()
+
+    def pick(self, chosen):
+        self.target.delete(0, "end")
+        self.target.insert(0, chosen.isoformat())
+        self.top.destroy()
+
+    def clear(self):
+        self.target.delete(0, "end")
+        self.top.destroy()
+
+    def draw(self):
+        for child in self.body.winfo_children():
+            child.destroy()
+
+        nav = tk.Frame(self.body, bg=WHITE)
+        nav.pack(fill="x", pady=(0, 8))
+
+        def nav_label(text, months):
+            lbl = tk.Label(nav, text=text, bg=PALE_BLUE, fg=BLUE, width=3,
+                           font=("Arial", 12, "bold"), cursor="hand2")
+            lbl.bind("<Button-1>", lambda event: self.shift(months))
+            return lbl
+
+        nav_label("«", -12).pack(side="left")
+        nav_label("‹", -1).pack(side="left", padx=(4, 0))
+        nav_label("»", 12).pack(side="right")
+        nav_label("›", 1).pack(side="right", padx=(0, 4))
+        tk.Label(nav, text=f"{calendar.month_name[self.month]} {self.year}",
+                 bg=WHITE, fg=TEXT, font=("Arial", 12, "bold")).pack(expand=True)
+
+        grid = tk.Frame(self.body, bg=WHITE)
+        grid.pack()
+        for col, name in enumerate(("Su", "Mo", "Tu", "We", "Th", "Fr", "Sa")):
+            tk.Label(grid, text=name, bg=WHITE, fg=MUTED, width=4,
+                     font=("Arial", 9, "bold")).grid(row=0, column=col)
+
+        today = date.today()
+        weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(self.year, self.month)
+        for row, week in enumerate(weeks, start=1):
+            for col, day in enumerate(week):
+                if not day:
+                    continue
+                current = date(self.year, self.month, day)
+                bg, fg = WHITE, TEXT
+                if current == today:
+                    bg, fg = PALE_BLUE, BLUE
+                if current == self.selected:
+                    bg, fg = BLUE, WHITE
+                cell = tk.Label(grid, text=str(day), bg=bg, fg=fg, width=4, height=2,
+                                font=("Arial", 10), cursor="hand2")
+                cell.grid(row=row, column=col, padx=1, pady=1)
+                cell.bind("<Button-1>", lambda event, d=current: self.pick(d))
+
+        footer = tk.Frame(self.body, bg=WHITE)
+        footer.pack(fill="x", pady=(10, 0))
+        button(footer, "Today", lambda: self.pick(date.today()),
+               color=PALE_BLUE, text_color=BLUE).pack(side="left")
+        if self.allow_clear:
+            button(footer, "Clear", self.clear, color="#f8e2e6",
+                   text_color=RED).pack(side="left", padx=8)
+        button(footer, "Cancel", self.top.destroy, color=PALE_BLUE,
+               text_color=BLUE).pack(side="right")
+
+
+class CalendarWindow:
+    """Independent popup with a full-month overview of the signed-in account."""
+
+    def __init__(self, app):
+        self.app = app
+        self.top = tk.Toplevel(app.root)
+        self.top.title("Care Calendar | Cat Care")
+        self.top.geometry("800x640")
+        self.top.minsize(610, 500)
+        self.top.configure(bg=BG)
+        mac_light_appearance(self.top)
+        self.top.transient(app.root)
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+
+        header = tk.Frame(self.top, bg=BG)
+        header.pack(fill="x", padx=20, pady=(17, 8))
+        label(header, "Care calendar", size=20, bold=True,
+              bg=BG).pack(side="left")
+        button(header, "Close", self.close, color=PALE_BLUE,
+               text_color=BLUE).pack(side="right")
+        label(self.top, "Select any date to see its care tasks. Colored task counts show activity.",
+              bg=BG, fg=MUTED).pack(anchor="w", padx=20, pady=(0, 12))
+        self.calendar = HomeCalendar(self.top, app)
+        self.calendar.frame.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        label(self.top, "Past open tasks: red   •   Today's open tasks: amber   •   "
+              "Future open tasks: blue   •   All completed: green",
+              bg=BG, fg=MUTED, size=9).pack(anchor="w", padx=20, pady=(0, 16))
+        # The calendar appears as the foremost, independently closeable window.
+        self.top.after_idle(self.top.lift)
+        self.top.after_idle(self.top.focus_set)
+
+    def close(self):
+        self.app.calendar_window = None
+        if self.top.winfo_exists():
+            self.top.destroy()
+
+
+class HomeCalendar:
+    """Month calendar rendered in the separate calendar popup."""
+
+    def __init__(self, parent, app):
+        self.app = app
+        today = date.today()
+        self.year, self.month = today.year, today.month
+        self.frame = tk.Frame(parent, bg=WHITE,
+                              highlightbackground=BORDER, highlightthickness=1)
+        self.refresh()
+
+    def shift(self, months):
+        total = self.year * 12 + (self.month - 1) + months
+        year, month = divmod(total, 12)
+        if 1 <= year <= 9999:
+            self.year, self.month = year, month + 1
+            self.refresh()
+
+    def go_today(self):
+        today = date.today()
+        self.year, self.month = today.year, today.month
+        self.refresh()
+
+    def refresh(self):
+        if self.app.user is None or not self.frame.winfo_exists():
+            return
+        try:
+            counts = store.task_counts(self.app.uid, self.year, self.month)
+        except ERRORS:
+            counts = {}
+        for child in self.frame.winfo_children():
+            child.destroy()
+
+        bar = tk.Frame(self.frame, bg=WHITE)
+        bar.pack(fill="x", padx=12, pady=(10, 6))
+        label(bar, f"{calendar.month_name[self.month]} {self.year}",
+              size=14, bold=True).pack(side="left")
+
+        def nav_label(text, months):
+            lbl = tk.Label(bar, text=text, bg=PALE_BLUE, fg=BLUE, width=3,
+                           font=("Arial", 12, "bold"), cursor="hand2")
+            lbl.bind("<Button-1>", lambda event: self.shift(months))
+            return lbl
+
+        button(bar, "Today", self.go_today, color=PALE_BLUE,
+               text_color=BLUE).pack(side="right", padx=(8, 0))
+        nav_label("›", 1).pack(side="right", padx=(4, 0))
+        nav_label("‹", -1).pack(side="right")
+
+        grid = tk.Frame(self.frame, bg=WHITE)
+        grid.pack(fill="x", padx=12, pady=(0, 12))
+        for col, name in enumerate(("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")):
+            grid.columnconfigure(col, weight=1, uniform="cal")
+            tk.Label(grid, text=name, bg=WHITE, fg=MUTED,
+                     font=("Arial", 9, "bold")).grid(row=0, column=col, pady=(0, 4))
+
+        today = date.today()
+        weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(self.year, self.month)
+        for row, week in enumerate(weeks, start=1):
+            for col, day_number in enumerate(week):
+                if not day_number:
+                    continue
+                current = date(self.year, self.month, day_number)
+                total, open_count = counts.get(current.isoformat(), (0, 0))
+                text, fg = str(day_number), TEXT
+                if total:
+                    text += f"\n{total} task" + ("" if total == 1 else "s")
+                    if open_count == 0:
+                        fg = GREEN
+                    elif current < today:
+                        fg = RED
+                    elif current == today:
+                        fg = "#a35b0d"
+                    else:
+                        fg = BLUE_DARK
+                cell = tk.Label(grid, text=text, bg=PALE_BLUE if current == today else WHITE,
+                                fg=fg, height=2, cursor="hand2",
+                                font=("Arial", 10, "bold" if total else "normal"),
+                                highlightbackground=BORDER, highlightthickness=1)
+                cell.grid(row=row, column=col, sticky="nsew", padx=1, pady=1)
+                cell.bind("<Button-1>", lambda event, d=current: self.app.open_day(d))
+
+
+class DayTasksWindow:
+    """Popup listing every task for one calendar day."""
+
+    def __init__(self, app, day):
+        self.app = app
+        self.day = day
+        self.top = tk.Toplevel(app.root)
+        self.top.title(f"Tasks for {day.isoformat()} | Cat Care")
+        self.top.geometry("780x440")
+        self.top.minsize(620, 320)
+        self.top.configure(bg=BG)
+        self.top.transient(app.root)
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+
+        header = tk.Frame(self.top, bg=WHITE)
+        header.pack(fill="x", padx=18, pady=(16, 8))
+        label(header, day.strftime("%A, %B %d, %Y").replace(" 0", " "),
+              size=17, bold=True).pack(side="left", padx=14, pady=12)
+        self.summary = label(self.top, "", bg=BG, fg=MUTED)
+        self.summary.pack(anchor="w", padx=28, pady=(2, 8))
+
+        table, self.tree = make_tree(
+            self.top,
+            (("cat", "Cat"), ("task", "Task"), ("category", "Category"),
+             ("recorded", "Recorded"), ("status", "Status")),
+            (140, 260, 130, 110, 110),
+        )
+        table.pack(fill="both", expand=True, padx=22, pady=(0, 8))
+        self.tree.bind("<Double-1>", self.open_cat)
+
+        actions = tk.Frame(self.top, bg=BG)
+        actions.pack(fill="x", padx=22, pady=(0, 18))
+        button(actions, "Complete / reopen", self.toggle, color=GREEN).pack(side="left")
+        button(actions, "Open selected cat", self.open_cat).pack(side="left", padx=8)
+        button(actions, "Close", self.close, color=PALE_BLUE,
+               text_color=BLUE).pack(side="right")
+        self.refresh()
+        self.top.after_idle(self.top.lift)
+
+    def refresh(self):
+        if self.app.user is None or not self.top.winfo_exists():
+            return
+        try:
+            rows = store.records_on_date(self.app.uid, self.day)
+        except ERRORS as exc:
+            messagebox.showerror("Couldn't load tasks", str(exc), parent=self.top)
+            return
+        today = date.today().isoformat()
+        rows = sorted(rows, key=lambda r: task_priority_key(r, today))
+        old = self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        tags = {"Overdue": "overdue", "Due today": "today", "Upcoming": "upcoming",
+                "No due date": "no_due", "Completed": "done"}
+        for record in rows:
+            status = task_attention_status(record, today)
+            self.tree.insert("", "end", iid=str(record["record_id"]),
+                             values=(record["cat_name"], record["task"],
+                                     record["category"], record["record_date"], status),
+                             tags=(tags[status],))
+        open_count = sum(r["status"] == "Open" for r in rows)
+        self.summary.configure(
+            text=(f"{open_count} open  •  {len(rows) - open_count} completed"
+                  if rows else "No tasks on this day."))
+        if old and self.tree.exists(old[0]):
+            self.tree.selection_set(old[0])
+
+    def selected_record(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("Select a task", "Select a task first.", parent=self.top)
+            return None
+        try:
+            return store.get_record(self.app.uid, int(selection[0]))
+        except ERRORS as exc:
+            messagebox.showerror("Task unavailable", str(exc), parent=self.top)
+            self.refresh()
+            return None
+
+    def open_cat(self, event=None):
+        record = self.selected_record()
+        if record is not None:
+            self.app.open_cat(record["cat_id"])
+
+    def toggle(self):
+        record = self.selected_record()
+        if record is None:
+            return
+        try:
+            store.toggle_record_status(self.app.uid, record["record_id"])
+        except ERRORS as exc:
+            messagebox.showerror("Couldn't change task", str(exc), parent=self.top)
+            return
+        self.app.refresh_views()
+
+    def close(self):
+        self.app.day_windows.pop(self.day.isoformat(), None)
+        if self.top.winfo_exists():
+            self.top.destroy()
+
+
+
 
 class TaskDialog:
     """Quick add/edit: choose a cat, preset task, and a due-date shortcut."""
@@ -1588,6 +2097,11 @@ class TaskDialog:
                                  value=date.today().isoformat())
         self.due_date = field(container, "Next due", 6,
                               value=date.today().isoformat())
+        self.picker = None
+        for box, clearable in ((self.record_date, False), (self.due_date, True)):
+            box.bind("<Button-1>",
+                     lambda event, b=box, c=clearable: self.show_picker(b, c), add="+")
+        
         shortcuts = tk.Frame(container, bg=WHITE)
         shortcuts.grid(row=7, column=1, sticky="w", pady=(0, 6))
         for caption, delta in (("Today", 0), ("Tomorrow", 1),
@@ -1638,6 +2152,11 @@ class TaskDialog:
         value = (date.today() + timedelta(days=days)).isoformat()
         self.due_date.delete(0, "end")
         self.due_date.insert(0, value)
+
+    def show_picker(self, box, clearable):
+        if self.picker is not None and self.picker.top.winfo_exists():
+            self.picker.top.destroy()
+        self.picker = DatePicker(self.top, box, allow_clear=clearable)
 
     def save(self):
         chosen = self.cat_ids.get(self.cat_choice.get())
