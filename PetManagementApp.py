@@ -1,17 +1,21 @@
-"""Cat Care / Health Tracker
+"""PetCare
 
-Keep this file next to your existing database.py; do not delete data/petcare.db.
-Run using the Python interpreter that displayed Tkinter successfully, e.g.:
-    python3.14 PetManagementApp_Combined.py
+Run: python PetManagementApp.py   (keep beside database.py; keep data/petcare.db)
+Scheduled reminders with app closed: python PetManagementApp.py --send-reminders
+Automated tests: python -m unittest discover -s tests -v
 
-Account data, cats and care records share data/petcare.db. This upgrade
-adds an app_user table and a nullable owner_id column to cat on first run.
 Accounts are local to this computer; the SQLite database is not encrypted.
+SMTP credentials must be provided via environment variables, never saved here.
 """
 
 import csv
 import hashlib
 import hmac
+import os
+import queue
+import smtplib
+import ssl
+import threading
 import json
 import re
 import secrets
@@ -21,6 +25,7 @@ import tkinter as tk
 import calendar
 from contextlib import closing
 from datetime import date, datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
@@ -32,6 +37,9 @@ import database as db
 # ---------- ACCOUNTS AND USER-SCOPED DATABASE OPERATIONS ----------
 ITERATIONS = 420_000
 USERNAME_PATTERN = re.compile(r"[a-zA-Z0-9_.-]{3,32}\Z")
+REPEAT_OPTIONS = ("Never", "Daily", "Weekly", "Monthly", "Every 3 months", "Yearly")
+NOTIFICATION_LEAD_DAYS = (0, 1, 3, 7)
+EMAIL_PATTERN = re.compile(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+\Z")
 
 
 class AccountError(ValueError):
@@ -97,6 +105,38 @@ def init():
                              "REFERENCES app_user(user_id) ON DELETE CASCADE")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_owner "
                          "ON cat(owner_id, name COLLATE NOCASE)")
+            record_columns = {row["name"] for row in
+                              conn.execute("PRAGMA table_info(care_record)")}
+            if "repeat_interval" not in record_columns:
+                conn.execute("ALTER TABLE care_record ADD COLUMN "
+                             "repeat_interval TEXT NOT NULL DEFAULT 'Never'")
+            if "recurrence_parent_id" not in record_columns:
+                conn.execute("ALTER TABLE care_record ADD COLUMN "
+                             "recurrence_parent_id INTEGER "
+                             "REFERENCES care_record(record_id) ON DELETE SET NULL")
+            if "recurrence_anchor_day" not in record_columns:
+                conn.execute("ALTER TABLE care_record ADD COLUMN "
+                             "recurrence_anchor_day INTEGER")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_recurrence_parent "
+                         "ON care_record(recurrence_parent_id) "
+                         "WHERE recurrence_parent_id IS NOT NULL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS email_preference (
+                    user_id INTEGER PRIMARY KEY REFERENCES app_user(user_id) ON DELETE CASCADE,
+                    email TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    lead_days INTEGER NOT NULL DEFAULT 1
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS notification_delivery (
+                    user_id INTEGER NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+                    record_id INTEGER NOT NULL REFERENCES care_record(record_id) ON DELETE CASCADE,
+                    due_date TEXT NOT NULL,
+                    sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (record_id, due_date)
+                )
+            """)
 
 
 def legacy_import_available():
@@ -259,7 +299,7 @@ def list_records(user_id, cat_id=None):
         return conn.execute("""
             SELECT r.record_id, r.cat_id, c.name AS cat_name,
                    r.category, r.task, r.record_date, r.next_due,
-                   r.notes, r.status
+                   r.notes, r.status, r.repeat_interval
             FROM care_record r
             JOIN cat c ON c.cat_id = r.cat_id
             WHERE c.owner_id = ?
@@ -272,7 +312,7 @@ def get_record(user_id, record_id):
     with closing(db.get_connection()) as conn:
         row = conn.execute("""
             SELECT r.record_id, r.cat_id, c.name AS cat_name, r.category,
-                   r.task, r.record_date, r.next_due, r.notes, r.status
+                   r.task, r.record_date, r.next_due, r.notes, r.status, r.repeat_interval
             FROM care_record r JOIN cat c ON c.cat_id = r.cat_id
             WHERE r.record_id = ? AND c.owner_id = ?
         """, (record_id, user_id)).fetchone()
@@ -281,48 +321,148 @@ def get_record(user_id, record_id):
     return row
 
 
-def add_record(user_id, cat_id, category, task, record_date, next_due=None, notes=None):
+def _repeat_interval(value, next_due):
+    if value not in REPEAT_OPTIONS:
+        raise AccountError("Choose a valid repeat interval.")
+    if value != "Never" and not next_due:
+        raise AccountError("A recurring task needs a Next due date.")
+    return value
+
+
+def _add_months(day, months, anchor_day=None):
+    """Clamp month ends without drifting the original day (Jan31->Feb28->Mar31)."""
+    new_year = day.year + (day.month - 1 + months) // 12
+    new_month = (day.month - 1 + months) % 12 + 1
+    last_day = calendar.monthrange(new_year, new_month)[1]
+    return date(new_year, new_month, min(anchor_day or day.day, last_day))
+
+
+def next_recurrence(due_date, repeat_interval, anchor_day=None):
+    """Return the immediately following due date, preserving the schedule."""
+    if repeat_interval not in REPEAT_OPTIONS or repeat_interval == "Never":
+        raise AccountError("This task does not have a repeat interval.")
+    current = date.fromisoformat(due_date)
+    if repeat_interval == "Daily":
+        return (current + timedelta(days=1)).isoformat()
+    if repeat_interval == "Weekly":
+        return (current + timedelta(weeks=1)).isoformat()
+    months = {"Monthly": 1, "Every 3 months": 3, "Yearly": 12}[repeat_interval]
+    return _add_months(current, months, anchor_day).isoformat()
+
+
+def add_record(user_id, cat_id, category, task, record_date, next_due=None,
+               notes=None, repeat_interval="Never"):
     user_id = _user_id(user_id)
     fields = db._record_fields(cat_id, category, task, record_date, next_due, notes)
+    repeat_interval = _repeat_interval(repeat_interval, fields[4])
+    anchor_day = int(fields[4][-2:]) if repeat_interval != "Never" else None
     with closing(db.get_connection()) as conn:
         with conn:
             _owned_cat(conn, user_id, fields[0])
             return conn.execute(
-                "INSERT INTO care_record (cat_id, category, task, record_date, next_due, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?)", fields
+                "INSERT INTO care_record (cat_id, category, task, record_date, next_due, "
+                "notes, repeat_interval, recurrence_anchor_day) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (*fields, repeat_interval, anchor_day)
             ).lastrowid
 
 
 def update_record(user_id, record_id, cat_id, category, task,
-                  record_date, next_due=None, notes=None):
+                  record_date, next_due=None, notes=None, repeat_interval="Never"):
     user_id, record_id = _user_id(user_id), _positive_id(record_id, "record ID")
     fields = db._record_fields(cat_id, category, task, record_date, next_due, notes)
+    repeat_interval = _repeat_interval(repeat_interval, fields[4])
     with closing(db.get_connection()) as conn:
         with conn:
             _owned_cat(conn, user_id, fields[0])
+            prior = conn.execute("""
+                SELECT r.next_due, r.repeat_interval, r.recurrence_anchor_day
+                FROM care_record r JOIN cat c ON c.cat_id = r.cat_id
+                WHERE r.record_id = ? AND c.owner_id = ?
+            """, (record_id, user_id)).fetchone()
+            if prior is None:
+                raise OwnershipError("Care record not found in your account.")
+            if repeat_interval == "Never":
+                anchor_day = None
+            elif prior["next_due"] == fields[4] and prior["repeat_interval"] == repeat_interval:
+                anchor_day = prior["recurrence_anchor_day"] or int(fields[4][-2:])
+            else:
+                anchor_day = int(fields[4][-2:])
             updated = conn.execute("""
                 UPDATE care_record SET cat_id = ?, category = ?, task = ?,
-                                       record_date = ?, next_due = ?, notes = ?
+                    record_date = ?, next_due = ?, notes = ?, repeat_interval = ?,
+                    recurrence_anchor_day = ?
                 WHERE record_id = ? AND cat_id IN
                       (SELECT cat_id FROM cat WHERE owner_id = ?)
-            """, (*fields, record_id, user_id)).rowcount
+            """, (*fields, repeat_interval, anchor_day, record_id, user_id)).rowcount
             if not updated:
                 raise OwnershipError("Care record not found in your account.")
     return record_id
 
 
 def toggle_record_status(user_id, record_id):
+    """Complete/reopen a task; completing a repeat creates one next occurrence.
+
+    Keep each completion as history. If reopening, remove the generated child
+    only when it is still an untouched open task without descendants; otherwise
+    refuse to reopen so that an established schedule cannot be silently lost.
+    """
     user_id, record_id = _user_id(user_id), _positive_id(record_id, "record ID")
     with closing(db.get_connection()) as conn:
         with conn:
-            updated = conn.execute("""
-                UPDATE care_record SET status =
-                    CASE WHEN status = 'Open' THEN 'Completed' ELSE 'Open' END
-                WHERE record_id = ? AND cat_id IN
-                      (SELECT cat_id FROM cat WHERE owner_id = ?)
-            """, (record_id, user_id)).rowcount
-            if not updated:
+            record = conn.execute("""
+                SELECT r.* FROM care_record r JOIN cat c ON c.cat_id = r.cat_id
+                WHERE r.record_id = ? AND c.owner_id = ?
+            """, (record_id, user_id)).fetchone()
+            if record is None:
                 raise OwnershipError("Care record not found in your account.")
+            if record["status"] == "Open":
+                conn.execute("UPDATE care_record SET status = 'Completed' "
+                             "WHERE record_id = ?", (record_id,))
+                if record["repeat_interval"] != "Never":
+                    if not record["next_due"]:
+                        raise AccountError("A repeating task needs a due date.")
+                    next_due = next_recurrence(record["next_due"],
+                                               record["repeat_interval"],
+                                               record["recurrence_anchor_day"])
+                    # The next record's date is the occurrence's scheduled day.
+                    conn.execute("""
+                        INSERT INTO care_record
+                            (cat_id, category, task, record_date, next_due, notes,
+                             repeat_interval, recurrence_parent_id, recurrence_anchor_day)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (record["cat_id"], record["category"], record["task"],
+                          next_due, next_due, record["notes"],
+                          record["repeat_interval"], record_id,
+                          record["recurrence_anchor_day"]))
+            else:
+                child = conn.execute("SELECT * FROM care_record "
+                                     "WHERE recurrence_parent_id = ?",
+                                     (record_id,)).fetchone()
+                if child is not None:
+                    grandchild = conn.execute("SELECT 1 FROM care_record "
+                                              "WHERE recurrence_parent_id = ?",
+                                              (child["record_id"],)).fetchone()
+                    expected_due = next_recurrence(record["next_due"],
+                                                   record["repeat_interval"],
+                                                   record["recurrence_anchor_day"])
+                    unchanged = (child["status"] == "Open" and grandchild is None
+                                 and child["cat_id"] == record["cat_id"]
+                                 and child["category"] == record["category"]
+                                 and child["task"] == record["task"]
+                                 and child["record_date"] == expected_due
+                                 and child["next_due"] == expected_due
+                                 and child["notes"] == record["notes"]
+                                 and child["repeat_interval"] == record["repeat_interval"]
+                                 and child["recurrence_anchor_day"] == record["recurrence_anchor_day"])
+                    if not unchanged:
+                        raise AccountError(
+                            "This task already has a modified/completed next occurrence. "
+                            "Edit that occurrence instead of reopening this one.")
+                    conn.execute("DELETE FROM care_record WHERE record_id = ?",
+                                 (child["record_id"],))
+                conn.execute("UPDATE care_record SET status = 'Open' "
+                             "WHERE record_id = ?", (record_id,))
 
 
 def delete_record(user_id, record_id):
@@ -360,7 +500,7 @@ def due_records(user_id):
     with closing(db.get_connection()) as conn:
         return conn.execute("""
             SELECT r.record_id, r.cat_id, c.name AS cat_name, r.category,
-                   r.task, r.record_date, r.next_due, r.notes, r.status
+                   r.task, r.record_date, r.next_due, r.notes, r.status, r.repeat_interval
             FROM care_record r JOIN cat c ON c.cat_id = r.cat_id
             WHERE c.owner_id = ? AND r.status = 'Open' AND r.next_due <= ?
             ORDER BY r.next_due, r.record_id
@@ -372,7 +512,7 @@ def records_on_date(user_id, day):
     with closing(db.get_connection()) as conn:
         return conn.execute("""
             SELECT r.record_id, r.cat_id, c.name AS cat_name, r.category,
-                   r.task, r.record_date, r.next_due, r.notes, r.status
+                   r.task, r.record_date, r.next_due, r.notes, r.status, r.repeat_interval
             FROM care_record r JOIN cat c ON c.cat_id = r.cat_id
             WHERE c.owner_id = ?
               AND COALESCE(NULLIF(r.next_due, ''), r.record_date) = ?
@@ -398,6 +538,168 @@ def task_counts(user_id, year, month):
 
 
 
+def _validated_email(value):
+    if not isinstance(value, str):
+        raise AccountError("Enter a valid email address.")
+    email = value.strip()
+    if len(email) > 254 or not EMAIL_PATTERN.fullmatch(email):
+        raise AccountError("Enter a valid email address (e.g., you@example.com).")
+    return email
+
+
+def get_email_preferences(user_id):
+    user_id = _user_id(user_id)
+    with closing(db.get_connection()) as conn:
+        row = conn.execute("SELECT email, enabled, lead_days FROM email_preference "
+                           "WHERE user_id = ?", (user_id,)).fetchone()
+    if row is None:
+        return {"email": "", "enabled": False, "lead_days": 1}
+    return {"email": row["email"], "enabled": bool(row["enabled"]),
+            "lead_days": row["lead_days"]}
+
+
+def set_email_preferences(user_id, email, enabled=False, lead_days=1):
+    user_id = _user_id(user_id)
+    if type(enabled) is not bool:
+        raise AccountError("Invalid notification setting.")
+    if type(lead_days) is not int or lead_days not in NOTIFICATION_LEAD_DAYS:
+        raise AccountError("Choose 0, 1, 3 or 7 days of advance notice.")
+    if not isinstance(email, str):
+        raise AccountError("Enter a valid email address.")
+    email = _validated_email(email) if email.strip() else ""
+    if enabled and not email:
+        raise AccountError("Enter an email address before enabling reminders.")
+    with closing(db.get_connection()) as conn:
+        with conn:
+            found = conn.execute("SELECT 1 FROM app_user WHERE user_id = ?",
+                                 (user_id,)).fetchone()
+            if found is None:
+                raise OwnershipError("Account not found.")
+            conn.execute("""
+                INSERT INTO email_preference (user_id, email, enabled, lead_days)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    email = excluded.email,
+                    enabled = excluded.enabled,
+                    lead_days = excluded.lead_days
+            """, (user_id, email, int(enabled), lead_days))
+    return get_email_preferences(user_id)
+
+
+def smtp_configured():
+    """SMTP credentials are never written to source, database or exports."""
+    return all(os.environ.get(var) for var in
+               ("PETCARE_SMTP_HOST", "PETCARE_SMTP_USERNAME",
+                "PETCARE_SMTP_PASSWORD", "PETCARE_SMTP_FROM"))
+
+
+def send_email(recipient, subject, body):
+    """Send using SMTP STARTTLS (usually 587) or SMTP_SSL (usually 465)."""
+    _validated_email(recipient)
+    if not smtp_configured():
+        raise AccountError("SMTP is not configured. See README for environment variables.")
+    try:
+        port = int(os.environ.get("PETCARE_SMTP_PORT", "587"))
+    except ValueError as exc:
+        raise AccountError("PETCARE_SMTP_PORT must be a number.") from exc
+    if not 1 <= port <= 65535:
+        raise AccountError("PETCARE_SMTP_PORT must be between 1 and 65535.")
+    msg = EmailMessage()
+    msg["To"] = recipient
+    msg["From"] = _validated_email(os.environ["PETCARE_SMTP_FROM"])
+    msg["Subject"] = subject
+    msg.set_content(body)
+    if port == 465:
+        with smtplib.SMTP_SSL(os.environ["PETCARE_SMTP_HOST"], port,
+                              timeout=12, context=ssl.create_default_context()) as smtp:
+            smtp.login(os.environ["PETCARE_SMTP_USERNAME"],
+                       os.environ["PETCARE_SMTP_PASSWORD"])
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(os.environ["PETCARE_SMTP_HOST"], port,
+                          timeout=12) as smtp:
+            smtp.ehlo()
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+            smtp.login(os.environ["PETCARE_SMTP_USERNAME"],
+                       os.environ["PETCARE_SMTP_PASSWORD"])
+            smtp.send_message(msg)
+
+
+def send_test_email(user_id):
+    prefs = get_email_preferences(user_id)
+    if not prefs["email"]:
+        raise AccountError("Save your email address before sending a test.")
+    send_email(prefs["email"], "Cat Care: test reminder",
+               "Email notifications are correctly configured for Cat Care!\n")
+
+
+def send_due_notifications(today=None, smtp_sender=None):
+    """Notify once per task/due-date, with an account-scoped digest.
+
+    Calls may be made on an OS schedule or while the desktop app runs.
+    Database transaction spans SMTP send to prevent concurrent double-sends;
+    a failure rolls back the delivery record so a future run can retry.
+    Returns counts and errors. `smtp_sender` lets tests avoid real SMTP.
+    """
+    if today is None:
+        today = date.today()
+    if isinstance(today, str):
+        today = date.fromisoformat(today)
+    if not isinstance(today, date):
+        raise ValueError("today must be a date or YYYY-MM-DD string")
+    smtp_sender = smtp_sender or send_email
+    result = {"users_sent": 0, "tasks_notified": 0, "errors": []}
+    with closing(db.get_connection()) as conn:
+        accounts = conn.execute("SELECT user_id FROM email_preference "
+                                "WHERE enabled = 1 ORDER BY user_id").fetchall()
+    for account in accounts:
+        user_id = account["user_id"]
+        try:
+            with closing(db.get_connection()) as conn:
+                with conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    prefs = conn.execute("SELECT email, lead_days, enabled "
+                                         "FROM email_preference WHERE user_id = ?",
+                                         (user_id,)).fetchone()
+                    if prefs is None or not prefs["enabled"]:
+                        continue
+                    until = (today + timedelta(days=prefs["lead_days"])).isoformat()
+                    pending = conn.execute("""
+                        SELECT r.record_id, r.task, r.next_due, c.name AS cat_name
+                        FROM care_record r JOIN cat c ON c.cat_id = r.cat_id
+                        WHERE c.owner_id = ? AND r.status = 'Open'
+                          AND r.next_due IS NOT NULL AND r.next_due <= ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM notification_delivery n
+                              WHERE n.record_id = r.record_id
+                                AND n.due_date = r.next_due
+                          )
+                        ORDER BY r.next_due, c.name COLLATE NOCASE, r.record_id
+                    """, (user_id, until)).fetchall()
+                    if not pending:
+                        continue
+                    lines = ["Here are your upcoming or overdue Cat Care tasks:", ""]
+                    for item in pending:
+                        lines.append(f"- {item['cat_name']}: {item['task']} "
+                                     f"(due {item['next_due']})")
+                    lines.extend(["", "Open Cat Care to mark tasks as completed.",
+                                  "You can disable emails in Notifications > Email settings."])
+                    smtp_sender(prefs["email"],
+                                f"Cat Care reminder: {len(pending)} task(s)",
+                                "\n".join(lines) + "\n")
+                    conn.executemany("""
+                        INSERT INTO notification_delivery (user_id, record_id, due_date)
+                        VALUES (?, ?, ?)
+                    """, [(user_id, item["record_id"], item["next_due"])
+                          for item in pending])
+                    result["users_sent"] += 1
+                    result["tasks_notified"] += len(pending)
+        except Exception as exc:
+            result["errors"].append(f"Account {user_id}: {exc}")
+    return result
+
+
 def _check_export_destination(destination):
     destination = Path(destination).expanduser().resolve()
     if destination == Path(db.DB_PATH).expanduser().resolve():
@@ -408,7 +710,7 @@ def _check_export_destination(destination):
 def export_records_csv(user_id, destination):
     destination = _check_export_destination(destination)
     fields = ("cat_name", "category", "task", "record_date", "next_due",
-              "notes", "status")
+              "notes", "status", "repeat_interval")
     rows = list_records(user_id)
     with open(destination, "w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -427,7 +729,7 @@ def export_account_json(user_id, destination):
         "cats": [{"name": c["name"], "breed": c["breed"],
                   "birthday": c["birthday"], "notes": c["notes"],
                   "records": [{key: r[key] for key in
-                               ("category", "task", "record_date", "next_due", "notes", "status")}
+                               ("category", "task", "record_date", "next_due", "notes", "status", "repeat_interval")}
                               for r in list_records(user_id, c["cat_id"])]}
                  for c in cats],
     }
@@ -459,6 +761,11 @@ store = SimpleNamespace(
     due_records=due_records,
     records_on_date=records_on_date,
     task_counts=task_counts,
+    next_recurrence=next_recurrence,
+    get_email_preferences=get_email_preferences,
+    set_email_preferences=set_email_preferences,
+    send_test_email=send_test_email,
+    send_due_notifications=send_due_notifications,
     export_records_csv=export_records_csv,
     export_account_json=export_account_json,
 )
@@ -772,6 +1079,10 @@ class PetCareApp:
         self.daily_window = None  # Separate, reopenable daily-task window
         self.calendar_window = None  # Independent, reopenable calendar popup
         self.day_windows = {}
+        self._notification_lock = threading.Lock()
+        # The periodic scan uses a daemon thread: never block the Tk event loop
+        # on a network request, and never interact with Tk from this thread.
+        self.root.after(10_000, self._email_check_tick)
 
         style = ttk.Style(self.root)
         # The native Aqua theme is the most reliable choice on macOS.
@@ -791,7 +1102,7 @@ class PetCareApp:
         style.configure("Treeview.Heading", font=("Arial", 10, "bold"),
                         background=PALE_BLUE, foreground=TEXT, padding=6)
         style.configure("TCombobox", padding=5)
-        print("Cat Care version: 2.6 (auto calendar + light tabs + search)", flush=True)
+        print("Cat Care version: 3.0 (recurring tasks + email reminders)", flush=True)
         print("Running Python:", sys.version.split()[0], sys.executable, flush=True)
         print("Running Tcl/Tk:", self.root.tk.call("info", "patchlevel"), flush=True)
         self.show_auth()
@@ -931,6 +1242,22 @@ class PetCareApp:
         confirm_box.bind("<Return>", lambda event: submit())
         username_box.focus_set()
 
+    def _email_check_tick(self):
+        """Check reminders every 30 minutes while the desktop app is open."""
+        if self._notification_lock.acquire(blocking=False):
+            def scan():
+                try:
+                    result = store.send_due_notifications()
+                    for error in result["errors"]:
+                        print("Email notification error:", error, file=sys.stderr)
+                finally:
+                    self._notification_lock.release()
+            threading.Thread(target=scan, daemon=True).start()
+        self.root.after(30 * 60 * 1000, self._email_check_tick)
+
+    def open_email_settings(self):
+        EmailSettingsDialog(self)
+
     def install_menu(self):
         menu = tk.Menu(self.root)
         view_menu = tk.Menu(menu, tearoff=False)
@@ -946,6 +1273,10 @@ class PetCareApp:
         data_menu.add_command(label="Export my account data (JSON)...",
                               command=self.export_json)
         menu.add_cascade(label="Data", menu=data_menu)
+        notification_menu = tk.Menu(menu, tearoff=False)
+        notification_menu.add_command(label="Email settings...",
+                                      command=self.open_email_settings)
+        menu.add_cascade(label="Notifications", menu=notification_menu)
         self.root.config(menu=menu)
 
     def show_dashboard_tab(self):
@@ -972,6 +1303,8 @@ class PetCareApp:
                color="#f5e2e7", text_color=RED).pack(side="right", padx=(8, 0))
         button(header_inner, "Open calendar", self.open_calendar,
                color=PALE_BLUE, text_color=BLUE).pack(side="right", padx=(8, 0))
+        button(header_inner, "Email settings", self.open_email_settings,
+               color=WHITE, text_color=BLUE_DARK).pack(side="right", padx=(8, 0))
         label(base, f"Signed in as {self.user['username']}",
               bg=BG, fg=MUTED).pack(anchor="w", padx=26, pady=(10, 4))
 
@@ -1465,6 +1798,104 @@ class DailyTaskWindow:
             self.top.destroy()
 
 
+class EmailSettingsDialog:
+    """Account-specific reminder preferences; never asks for an SMTP password."""
+
+    def __init__(self, app):
+        self.app = app
+        self.top = tk.Toplevel(app.root)
+        app.track_dialog(self.top)
+        self.top.title("Email reminders | Cat Care")
+        self.top.geometry("550x370")
+        self.top.minsize(480, 350)
+        self.top.configure(bg=WHITE)
+        self.top.transient(app.root)
+        prefs = store.get_email_preferences(app.uid)
+        self.test_results = queue.Queue()
+        self.testing = False
+
+        area = tk.Frame(self.top, bg=WHITE, padx=23, pady=20)
+        area.pack(fill="both", expand=True)
+        area.columnconfigure(1, weight=1)
+        label(area, "Email reminder settings", size=16, bold=True).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        label(area, "Email address", bold=True).grid(row=1, column=0,
+                                                    sticky="w", pady=8)
+        self.email = ttk.Entry(area, width=34)
+        self.email.grid(row=1, column=1, sticky="ew", pady=8)
+        self.email.insert(0, prefs["email"])
+
+        self.enabled = tk.BooleanVar(value=prefs["enabled"])
+        ttk.Checkbutton(area, text="Send reminders for upcoming and overdue tasks",
+                        variable=self.enabled).grid(row=2, column=0, columnspan=2,
+                                                    sticky="w", pady=(8, 12))
+        label(area, "Remind me", bold=True).grid(row=3, column=0, sticky="w", pady=8)
+        self.days = ttk.Combobox(area, state="readonly", width=19,
+                                 values=("On the due date", "1 day ahead",
+                                         "3 days ahead", "7 days ahead"))
+        self.days.grid(row=3, column=1, sticky="w", pady=8)
+        self.days.current(NOTIFICATION_LEAD_DAYS.index(prefs["lead_days"]))
+        info = ("SMTP environment variables: configured."
+                if smtp_configured() else
+                "SMTP not configured. Set credentials using the README instructions.")
+        label(area, info, fg=GREEN if smtp_configured() else RED,
+              size=9).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 3))
+        label(area, "Emails send while the app is open; to send when closed, "
+                    "schedule the --send-reminders command.",
+              fg=MUTED, size=9, wraplength=490).grid(
+                  row=5, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.feedback = label(area, "", fg=GREEN, size=9)
+        self.feedback.grid(row=6, column=0, columnspan=2, sticky="w")
+        actions = tk.Frame(area, bg=WHITE)
+        actions.grid(row=7, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        button(actions, "Send test email", self.send_test,
+               color=PALE_BLUE, text_color=BLUE).pack(side="left", padx=8)
+        button(actions, "Save", self.save).pack(side="left")
+        button(actions, "Close", self.top.destroy,
+               color=PALE_BLUE, text_color=BLUE).pack(side="left", padx=(8, 0))
+
+    def save(self):
+        try:
+            store.set_email_preferences(
+                self.app.uid, self.email.get(), self.enabled.get(),
+                NOTIFICATION_LEAD_DAYS[self.days.current()])
+        except (ValueError, *ERRORS) as exc:
+            messagebox.showerror("Could not save settings", str(exc), parent=self.top)
+            return False
+        self.feedback.configure(text="Settings saved.", fg=GREEN)
+        return True
+
+    def send_test(self):
+        if self.testing or not self.save():
+            return
+        self.testing = True
+        self.feedback.configure(text="Sending test email...", fg=MUTED)
+        def worker():
+            try:
+                store.send_test_email(self.app.uid)
+            except Exception as exc:
+                self.test_results.put(str(exc))
+            else:
+                self.test_results.put(None)
+        threading.Thread(target=worker, daemon=True).start()
+        self.top.after(150, self.show_test_result)
+
+    def show_test_result(self):
+        if not self.top.winfo_exists():
+            return
+        try:
+            error = self.test_results.get_nowait()
+        except queue.Empty:
+            self.top.after(150, self.show_test_result)
+            return
+        self.testing = False
+        if error:
+            self.feedback.configure(text="Test failed. Check SMTP settings.", fg=RED)
+            messagebox.showerror("Email test failed", error, parent=self.top)
+        else:
+            self.feedback.configure(text="Test email sent! Check your inbox.", fg=GREEN)
+
+
 class CatDialog:
     """Add a new cat; profiles can also be edited from their individual window."""
     def __init__(self, app):
@@ -1570,8 +2001,8 @@ class CatWindow:
                 page,
                 (("task", "Task"), ("category", "Category"),
                  ("record_date", "Recorded"), ("next_due", "Next due"),
-                 ("status", "Status")),
-                (250, 140, 110, 110, 110),
+                 ("repeat", "Repeat"), ("status", "Status")),
+                (220, 120, 100, 100, 120, 100),
             )
             outer.pack(fill="both", expand=True, padx=12, pady=(0, 8))
             row = tk.Frame(page, bg=WHITE)
@@ -1644,7 +2075,8 @@ class CatWindow:
                 tree.insert("", "end", iid=str(record["record_id"]),
                             values=(record["task"], record["category"],
                                     record["record_date"], record["next_due"] or "",
-                                    display_status), tags=(tag,))
+                                    record["repeat_interval"], display_status),
+                            tags=(tag,))
 
     def _selected_record(self, tree):
         selected = tree.selection()
@@ -2050,8 +2482,8 @@ class TaskDialog:
         # Use the same native appearance as the parent.
         app.track_dialog(self.top)
         self.top.title("Edit care record" if record_id else "Quick add a task")
-        self.top.geometry("560x600")
-        self.top.minsize(470, 510)
+        self.top.geometry("590x660")
+        self.top.minsize(490, 560)
         self.top.configure(bg=WHITE)
         self.top.transient(self.parent)
         container = tk.Frame(self.top, bg=WHITE, padx=25, pady=20)
@@ -2097,27 +2529,33 @@ class TaskDialog:
                                  value=date.today().isoformat())
         self.due_date = field(container, "Next due", 6,
                               value=date.today().isoformat())
+        label(container, "Repeat", bold=True).grid(row=7, column=0,
+                                                   sticky="w", pady=8)
+        self.repeat = ttk.Combobox(container, state="readonly", values=REPEAT_OPTIONS,
+                                   width=30)
+        self.repeat.grid(row=7, column=1, sticky="ew", pady=8)
+        self.repeat.set("Never")
         self.picker = None
         for box, clearable in ((self.record_date, False), (self.due_date, True)):
             box.bind("<Button-1>",
                      lambda event, b=box, c=clearable: self.show_picker(b, c), add="+")
         
         shortcuts = tk.Frame(container, bg=WHITE)
-        shortcuts.grid(row=7, column=1, sticky="w", pady=(0, 6))
+        shortcuts.grid(row=8, column=1, sticky="w", pady=(0, 6))
         for caption, delta in (("Today", 0), ("Tomorrow", 1),
                                ("+7 days", 7), ("+30 days", 30)):
             button(shortcuts, caption, lambda d=delta: self.set_due(d),
                    color=PALE_BLUE, text_color=BLUE).pack(
                        side="left", padx=(0, 5))
         label(container, "Dates: YYYY-MM-DD. Next due may be left blank.",
-              fg=MUTED, size=9).grid(row=8, column=1, sticky="w", pady=(0, 8))
-        label(container, "Notes", bold=True).grid(row=9, column=0, sticky="nw", pady=8)
+              fg=MUTED, size=9).grid(row=9, column=1, sticky="w", pady=(0, 8))
+        label(container, "Notes", bold=True).grid(row=10, column=0, sticky="nw", pady=8)
         self.notes = tk.Text(container, height=4, bg=WHITE, fg=TEXT,
                              relief="solid", bd=1, wrap="word",
                              font=("Arial", 10))
-        self.notes.grid(row=9, column=1, sticky="nsew", pady=8)
+        self.notes.grid(row=10, column=1, sticky="nsew", pady=8)
         controls = tk.Frame(container, bg=WHITE)
-        controls.grid(row=10, column=0, columnspan=2, sticky="e", pady=(15, 0))
+        controls.grid(row=11, column=0, columnspan=2, sticky="e", pady=(15, 0))
         button(controls, "Cancel", self.top.destroy, color=PALE_BLUE,
                text_color=BLUE).pack(side="left", padx=8)
         button(controls, "Save changes" if record_id else "Add task",
@@ -2141,6 +2579,7 @@ class TaskDialog:
             self.due_date.delete(0, "end")
             self.due_date.insert(0, record["next_due"] or "")
             self.notes.insert("1.0", record["notes"] or "")
+            self.repeat.set(record["repeat_interval"])
         self.task.focus_set()
 
     def category_changed(self, event=None, clear_task=True):
@@ -2167,7 +2606,7 @@ class TaskDialog:
             fields = (chosen, self.category.get(), self.task.get().strip(),
                       require_date(self.record_date.get(), "Record date"),
                       require_date(self.due_date.get(), "Next due", optional=True),
-                      text_value(self.notes))
+                      text_value(self.notes), self.repeat.get())
             if self.record_id is None:
                 store.add_record(self.app.uid, *fields)
             else:
@@ -2180,8 +2619,26 @@ class TaskDialog:
 
 
 if __name__ == "__main__":
-    try:
-        PetCareApp().run()
-    except (sqlite3.Error, OSError) as error:
-        print("Unable to start Cat Care:", error, file=sys.stderr)
-        raise
+    if len(sys.argv) == 2 and sys.argv[1] == "--send-reminders":
+        # No Tk window is needed. Configure this command in the OS scheduler
+        # for reminders to run when the desktop application is closed.
+        try:
+            store.init()
+            outcome = store.send_due_notifications()
+            print(f"Email digests sent: {outcome['users_sent']}; "
+                  f"tasks reminded: {outcome['tasks_notified']}")
+            for error in outcome["errors"]:
+                print("Error:", error, file=sys.stderr)
+            sys.exit(bool(outcome["errors"]))
+        except (sqlite3.Error, OSError, AccountError) as exc:
+            print("Cannot send reminders:", exc, file=sys.stderr)
+            sys.exit(1)
+    elif len(sys.argv) > 1:
+        print("Usage: python PetManagementApp.py [--send-reminders]", file=sys.stderr)
+        sys.exit(2)
+    else:
+        try:
+            PetCareApp().run()
+        except (sqlite3.Error, OSError) as error:
+            print("Unable to start Cat Care:", error, file=sys.stderr)
+            raise
