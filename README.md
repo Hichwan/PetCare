@@ -1,33 +1,47 @@
 # PetCare
 
-Desktop cat-care management app built with **Python, Tkinter and SQLite**
+PetCare is a desktop app we created using Python, Tkinter, and SQLite. Our goal was to make it easier to keep track of our cats' information and things like feeding, medication, vaccinations, and vet appointments.
 
-## Files
+## What the app can do
 
-- `PetManagementApp.py` — main application, database operations, GUI and email-reminder command.
-- `database.py` — SQLite connection helpers, schema, basic data validation.
-- `tests/test_petcare.py` — automated tests; **never sends a real email**.
-- `.github/workflows/tests.yml` — runs tests automatically on GitHub pushes and pull requests.
+- Create an account and log in.
+- Add, edit, and manage cat profiles.
+- Add tasks with due dates and mark them as completed.
+- Set tasks to repeat daily, weekly, monthly, every three months, or yearly.
+- View upcoming and overdue tasks.
+- Get optional email reminders.
+- Export records to CSV or JSON.
 
-No third-party Python packages are needed. Use **Python 3.11+** with Tkinter installed. Some Linux installations require an OS package such as `python3-tk`.
+## Project files
 
-## Start the app
+- PetManagementApp.py – The main program, including the Tkinter interface and reminder features.
+- database.py – Handles the SQLite database and checks that saved data is valid.
+- test_petcare.py – Automated tests that we run on our computer.
+- data/petcare.db – The local database that stores user and cat information.
 
-1. **Back up your existing project and especially `data/petcare.db`** before replacing files or trying a migration. If you already have a `database.py`, back it up too: the copy in this package was reconstructed from the interface used by your uploaded main file.
-2. Keep `PetManagementApp.py` next to `database.py`.
-3. In this folder, run:
+The project uses Python 3.11 or newer. It doesn't need any extra Python packages, but Tkinter needs to be installed.
 
-   ```bash
-   python PetManagementApp.py
-   ```
+## How to run it
 
-4. Register or sign in. The app creates `data/petcare.db` on first launch if it doesn't already exist. If you already have a compatible database, `init()` adds new columns/tables **without intentionally deleting existing records**.
+We open the project folder in VS Code and make sure the terminal is in the folder containing PetManagementApp.py.
 
-For testing with a separate database, set `PETCARE_DB_PATH` to a temporary SQLite file before running the app. Never run unfamiliar upgrades on your only copy of real data.
+Then we run:
 
-## 1. Recurring tasks
+bash python3 PetManagementApp.py 
 
-Open a cat profile or **Quick task**. Set its **Next due** date and choose **Repeat**:
+Once the application opens, we can create an account or log in with an existing one.
+
+The application saves all information in a local SQLite database.
+
+Important: If we update an older version, we make sure to back up data/petcare.db and database.py first so we don't accidentally lose any information.
+
+## 1. Recurring Tasks
+
+We added recurring tasks because some cat-care activities need to be done regularly, such as giving medication or scheduling vaccinations.
+
+When creating or editing a task, we can choose how often it repeats.
+
+The available options are:
 
 - Never
 - Daily
@@ -36,81 +50,145 @@ Open a cat profile or **Quick task**. Set its **Next due** date and choose **Rep
 - Every 3 months
 - Yearly
 
-When you mark an open recurring task **Completed**, the original stays in the history and the app creates the **next open occurrence** automatically. The next date is calculated from the **scheduled due date**, not the date you clicked Completed. Monthly/yearly tasks maintain their original day when possible (January 31 → February 28 → March 31). A task must have a due date in order to repeat.
+For example, if we create a medication task that repeats daily, the application automatically creates the next task when we mark the current one as completed.
 
-If you reopen a completed recurring task, the app removes its generated next occurrence **only if it's still unchanged and open**. If the next occurrence was edited or completed, reopening the old record is blocked to protect the established schedule. Edit the current occurrence instead.
+The completed task stays in the history so we can still see which tasks have already been finished.
 
-Future occurrences aren't all generated in advance: the next one is created when you complete the current one.
+We also made sure that monthly tasks handle dates correctly. For example, a task scheduled for January 31 would repeat on February 28 and then March 31.
 
-## 2. Optional email reminders
+The application only creates the next task after the current one is completed instead of creating every future task at once.
 
-Email is **off by default**. After signing in, choose **Notifications → Email settings…** or the **Email settings** button. Enter your email address, enable notifications, and select **0, 1, 3 or 7 days** of advance notice. You can click **Send test email** to verify SMTP settings.
+## 2. Email Notifications
 
-The app sends a **single digest email** for all matching, still-open tasks in your account. It includes overdue tasks and tasks due within your selected advance-notice window. Each task is normally emailed **once per due date**, not every day. If you edit its due date, it can be notified again for the new date. An unsuccessful email send is *not* recorded as delivered and can be retried.
+Another feature we added is email reminders.
 
-### Configure SMTP securely
+This allows users to receive notifications about upcoming or overdue tasks.
 
-**You must supply an SMTP provider and credentials.** Never paste secrets into `PetManagementApp.py`, the SQLite database, tests, or GitHub. Some email providers require a separate app password or token.
+Email notifications are turned off by default, so users have to enable them first.
 
-On **macOS/Linux** in a terminal (replace placeholders with details from your email provider):
+### How to Enable Email Notifications
 
-```bash
-export PETCARE_SMTP_HOST="smtp.example.com"
-export PETCARE_SMTP_PORT="587"
-export PETCARE_SMTP_USERNAME="you@example.com"
-export PETCARE_SMTP_PASSWORD="YOUR_SMTP_APP_PASSWORD"
-export PETCARE_SMTP_FROM="you@example.com"
-python PetManagementApp.py
-```
+1. Log into the application.
+2. Open Notifications → Email settings.
+3. Enter the email address where reminders should be sent.
+4. Enable email notifications.
+5. Choose when to receive reminders.
+6. Save the settings.
 
-On **Windows PowerShell**, set the equivalent environment variables before launching Python:
+Users can choose to receive notifications on the due date or 1, 3, or 7 days before a task is due.
 
-```powershell
-$env:PETCARE_SMTP_HOST="smtp.example.com"
-$env:PETCARE_SMTP_PORT="587"
-$env:PETCARE_SMTP_USERNAME="you@example.com"
-$env:PETCARE_SMTP_PASSWORD="YOUR_SMTP_APP_PASSWORD"
-$env:PETCARE_SMTP_FROM="you@example.com"
-python PetManagementApp.py
-```
+Instead of sending a separate email for every task, the application combines upcoming and overdue tasks into one email.
 
-**Port 587** uses SMTP + STARTTLS. **Port 465** uses SMTP over SSL. TLS certificate verification is enabled. SMTP sending has a 12-second timeout. Email preferences are saved per user, but **SMTP passwords are read from environment variables only**. Email addresses in local SQLite are not encrypted.
+It also keeps track of which reminders have already been sent to avoid sending the same notification repeatedly.
 
-### When are emails sent?
+### Setting Up SMTP
 
-- **While the app is running:** it checks after ~10 seconds, then every 30 minutes, using a background thread so Tkinter stays responsive.
-- **When the app is closed:** nothing runs on its own. Schedule the following command using Windows Task Scheduler, macOS `launchd`, or Linux `cron`:
+For the email feature to work, we need to configure an SMTP account.
 
-  ```bash
-  python /full/path/to/PetManagementApp.py --send-reminders
-  ```
+Since we're using macOS, we can do this through the VS Code terminal.
 
-  Configure the scheduler to supply the five `PETCARE_SMTP_*` environment variables. The command uses the same database file as the app; it runs **without opening a GUI**. Running it daily (e.g. morning) provides daily checks, while reminders still send **only once per task and due date**. It exits with a nonzero status if sending failed.
+For example, using Gmail:
 
-  For cron, an example schedule is `0 8 * * * /full/path/to/python /full/path/to/PetManagementApp.py --send-reminders` **provided SMTP variables are securely available to that process**. Choose a full interpreter path and don't put passwords in your crontab or repository.
+bash export PETCARE_SMTP_HOST="smtp.gmail.com" export PETCARE_SMTP_PORT="587" export PETCARE_SMTP_USERNAME="your_email@gmail.com" export PETCARE_SMTP_FROM="your_email@gmail.com"  printf "Gmail app password: " read -s PETCARE_SMTP_PASSWORD echo export PETCARE_SMTP_PASSWORD  python3 PetManagementApp.py 
 
-### Email troubleshooting
+We need to replace the example email address with the Gmail account we're using.
 
-- No email: confirm you enabled notifications and saved a valid address. Try **Send test email**.
-- Provider rejects login: use the provider's supported SMTP authentication method and (if supported) an app password rather than your normal account password.
-- Your app is closed: schedule `--send-reminders`; a Tkinter desktop app can't send by itself while closed.
-- Duplicate alerts on the same date shouldn't happen for a sent notification: delivery is tracked in SQLite. If due dates change, a new notice is allowed.
+Gmail generally requires two-step verification and an app password for this type of connection.
 
-## 3. Automated testing
+The password is entered through the terminal instead of being saved directly in the Python code.
 
-From the project folder:
+Once everything is configured, we can use the Send test email button to check whether notifications are working.
 
-```bash
-python -m unittest discover -s tests -v
-```
+### When Are Emails Sent?
 
-The tests create **temporary databases**, replace expensive hashing parameters *only for tests*, and mock the SMTP sender so **no messages are sent and your real `data/petcare.db` is not touched**. They cover account isolation, legacy-data migration, repeating schedules, month-end dates, task completion/reopening, editing/exports, notification timing, opt-in privacy, deduplication, failed-email retries, deletion cleanup, SMTP TLS configuration and headless CLI error handling.
+While the application is running, it automatically checks for tasks that need reminders.
 
-When you upload this folder's contents to the root of a GitHub repository, GitHub Actions can run the tests on every push and pull request using `.github/workflows/tests.yml`.
+If the application is closed, it won't send notifications on its own.
 
-## Important notes
+To send reminders while the main application is closed, we can set up a scheduled task on our computer to run:
 
-- The uploaded main file referenced a `database.py` that was **not provided**. The package therefore includes a **compatible replacement**. Its migration was tested on a simulated earlier schema, but compatibility with your specific original `database.py` and existing data was **not** verified. Back up the database before using this version on real data.
-- Automated tests were executed locally. The GUI was also smoke-tested in a virtual X display. **Live SMTP delivery was not tested** because no account credentials were supplied.
-- No GUI window is needed to run automated tests or the `--send-reminders` command.
-- Accounts and cat-care records are stored locally in SQLite; the database itself is **not encrypted**. Protect your computer and backups accordingly.
+bash python3 PetManagementApp.py --send-reminders 
+
+This allows the program to check for reminders without opening the main window.
+
+## 3. Automated Testing
+
+We also added automated testing to help make sure the main features of our application work correctly.
+
+For this, we used Python's built-in unittest library.
+
+This allows us to test different parts of the program without having to manually go through every feature each time we make changes.
+
+### How We Run the Tests
+
+We run the tests directly from the terminal in VS Code.
+
+First, we open the folder containing test_petcare.py.
+
+Then we enter:
+
+bash python3 -m unittest discover -s . -p "test_*.py" -v 
+
+Python automatically finds the test file and runs the tests.
+
+The results appear in the terminal.
+
+If a test passes, it shows:
+
+text test_example ... ok 
+
+If something goes wrong, it displays FAIL or ERROR along with information about the problem.
+
+When all the tests pass, the terminal displays something similar to:
+
+text Ran 20 tests  OK 
+
+This lets us check whether our changes are working correctly.
+
+### What We Test
+
+Our automated tests cover several important parts of the application, including:
+
+- Creating user accounts and logging in.
+- Checking that users can only access their own data.
+- Creating and completing recurring tasks.
+- Calculating the next date for recurring tasks.
+- Editing and exporting records.
+- Making sure database changes work correctly.
+- Checking email notification settings.
+- Preventing duplicate email reminders.
+- Handling unsuccessful email attempts.
+
+The tests use temporary databases, so they don't affect the actual information saved in our application.
+
+Email sending is also simulated during automated testing, which means the tests don't send real emails.
+
+### Manual Testing
+
+Besides automated testing, we also test the application ourselves by using its interface.
+
+For example, we can:
+
+1. Create a test account and log in.
+2. Add a cat profile.
+3. Create a medication task that repeats daily.
+4. Mark the task as completed.
+5. Check that the next task is automatically created.
+6. Open the calendar and check the upcoming tasks.
+7. Configure email notifications and send a test email.
+
+This helps us check that the application works correctly from a user's perspective and not just through the automated tests.
+
+## Additional Notes
+
+The application stores its information locally using SQLite.
+
+The database itself is not encrypted, so it's important to keep backups and protect the computer where the application is installed.
+
+SMTP passwords are provided through environment variables rather than being stored in the program.
+
+The automated tests don't send real emails, so actual email delivery needs to be checked separately using the test email feature.
+
+Overall, our main goal with this project was to create an application that makes it easier to organize cat-care information and keep track of important tasks.
+
+By adding recurring tasks and email notifications, we made the application more useful because users don't have to remember or manually recreate every task themselves.
