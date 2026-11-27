@@ -57,60 +57,7 @@ We also made sure that monthly tasks handle dates correctly. For example, a task
 
 The application only creates the next task after the current one is completed instead of creating every future task at once.
 
-## 2. Email Notifications
-
-Another feature we added is email reminders.
-
-This allows users to receive notifications about upcoming or overdue tasks.
-
-Email notifications are turned off by default, so users have to enable them first.
-
-### How to Enable Email Notifications
-
-1. Log into the application.
-2. Open Notifications → Email settings.
-3. Enter the email address where reminders should be sent.
-4. Enable email notifications.
-5. Choose when to receive reminders.
-6. Save the settings.
-
-Users can choose to receive notifications on the due date or 1, 3, or 7 days before a task is due.
-
-Instead of sending a separate email for every task, the application combines upcoming and overdue tasks into one email.
-
-It also keeps track of which reminders have already been sent to avoid sending the same notification repeatedly.
-
-### Setting Up SMTP
-
-For the email feature to work, we need to configure an SMTP account.
-
-Since we're using macOS, we can do this through the VS Code terminal.
-
-For example, using Gmail:
-
-bash export PETCARE_SMTP_HOST="smtp.gmail.com" export PETCARE_SMTP_PORT="587" export PETCARE_SMTP_USERNAME="your_email@gmail.com" export PETCARE_SMTP_FROM="your_email@gmail.com"  printf "Gmail app password: " read -s PETCARE_SMTP_PASSWORD echo export PETCARE_SMTP_PASSWORD  python3 PetManagementApp.py 
-
-We need to replace the example email address with the Gmail account we're using.
-
-Gmail generally requires two-step verification and an app password for this type of connection.
-
-The password is entered through the terminal instead of being saved directly in the Python code.
-
-Once everything is configured, we can use the Send test email button to check whether notifications are working.
-
-### When Are Emails Sent?
-
-While the application is running, it automatically checks for tasks that need reminders.
-
-If the application is closed, it won't send notifications on its own.
-
-To send reminders while the main application is closed, we can set up a scheduled task on our computer to run:
-
-bash python3 PetManagementApp.py --send-reminders 
-
-This allows the program to check for reminders without opening the main window.
-
-## 3. Automated Testing
+## 2. Automated Testing
 
 We also added automated testing to help make sure the main features of our application work correctly.
 
