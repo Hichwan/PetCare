@@ -9,7 +9,6 @@ PetCare is a desktop app we created using Python, Tkinter, and SQLite. Our goal 
 - Add tasks with due dates and mark them as completed.
 - Set tasks to repeat daily, weekly, monthly, every three months, or yearly.
 - View upcoming and overdue tasks.
-- Get optional email reminders.
 - Export records to CSV or JSON.
 
 ## Project files
